@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +28,31 @@ import (
 // when given an ".onnx" model file.
 var companionSuffixes = map[string][]string{
 	".onnx": {".onnx.json"},
+}
+
+// ggufSplitRe matches split GGUF filenames: <base>-NNNNN-of-MMMMM.gguf
+var ggufSplitRe = regexp.MustCompile(`^(.*)-(\d{5})-of-(\d{5})\.gguf$`)
+
+// ggufPaths returns the paths to stage for a GGUF model file. For split GGUF
+// files it returns all shards in ascending order; for all other files it
+// returns a single-element slice containing path itself.
+func ggufPaths(path string) []string {
+	dir := filepath.Dir(path)
+	name := filepath.Base(path)
+	m := ggufSplitRe.FindStringSubmatch(name)
+	if m == nil {
+		return []string{path}
+	}
+	base, totalStr := m[1], m[3]
+	total, err := strconv.Atoi(totalStr)
+	if err != nil {
+		return []string{path}
+	}
+	shards := make([]string, total)
+	for i := 1; i <= total; i++ {
+		shards[i-1] = filepath.Join(dir, fmt.Sprintf("%s-%05d-of-%05d.gguf", base, i, total))
+	}
+	return shards
 }
 
 // SmartRouterOptions holds all dependencies for constructing a SmartRouter.
@@ -576,8 +603,11 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 	// Count stageable files for progress tracking
 	totalFiles := 0
 	for _, f := range fields {
-		if *f.val != "" {
-			if _, err := os.Stat(*f.val); err == nil {
+		if *f.val == "" {
+			continue
+		}
+		for _, p := range ggufPaths(*f.val) {
+			if _, err := os.Stat(p); err == nil {
 				totalFiles++
 			}
 		}
@@ -604,50 +634,67 @@ func (r *SmartRouter) stageModelFiles(ctx context.Context, node *BackendNode, op
 		if *f.val == "" {
 			continue
 		}
-		// Skip non-existent files
 		if _, err := os.Stat(*f.val); os.IsNotExist(err) {
 			xlog.Debug("Skipping staging for non-existent path", "field", f.name, "path", *f.val)
 			*f.val = ""
 			continue
 		}
-		fileIdx++
-		localPath := *f.val
-		key := keyMapper.Key(localPath)
 
-		// Attach progress callback to context for byte-level tracking
-		fileName := filepath.Base(localPath)
-		stageCtx := r.withStagingCallback(ctx, trackingKey, fileName, fileIdx, totalFiles)
+		localFieldPath := *f.val
 
-		xlog.Info("Staging file", "model", trackingKey, "node", node.Name, "field", f.name, "file", fileName, "fileIndex", fileIdx, "totalFiles", totalFiles)
+		// Use a cancellation-immune context — a client disconnect must not
+		// abort a multi-GB upload mid-transfer.
+		uploadCtx := context.WithoutCancel(ctx)
+		paths := ggufPaths(localFieldPath)
 
-		remotePath, err := r.fileStager.EnsureRemote(stageCtx, node.ID, localPath, key)
-		if err != nil {
-			// ModelFile is required — fail the whole operation
-			if f.name == "ModelFile" {
-				xlog.Error("Failed to stage model file for remote node", "node", node.Name, "field", f.name, "path", localPath, "error", err)
-				return nil, fmt.Errorf("staging model file: %w", err)
+		var primaryRemotePath string
+		stageFailed := false
+		for _, localPath := range paths {
+			if _, err := os.Stat(localPath); err != nil {
+				continue
 			}
-			// Optional files: clear the path so the backend doesn't try a non-existent frontend path
-			xlog.Warn("Failed to stage model file, clearing field", "field", f.name, "path", localPath, "error", err)
+			fileIdx++
+			fileName := filepath.Base(localPath)
+			stageCtx := r.withStagingCallback(uploadCtx, trackingKey, fileName, fileIdx, totalFiles)
+			key := keyMapper.Key(localPath)
+
+			xlog.Debug("Staging file", "model", trackingKey, "node", node.Name, "field", f.name, "file", fileName, "fileIndex", fileIdx, "totalFiles", totalFiles)
+
+			remotePath, err := r.fileStager.EnsureRemote(stageCtx, node.ID, localPath, key)
+			if err != nil {
+				if f.name == "ModelFile" {
+					xlog.Error("Failed to stage model file for remote node", "node", node.Name, "field", f.name, "path", localPath, "error", err)
+					return nil, fmt.Errorf("staging model file: %w", err)
+				}
+				xlog.Warn("Failed to stage model file, clearing field", "field", f.name, "path", localPath, "error", err)
+				stageFailed = true
+				break
+			}
+
+			r.stagingTracker.FileComplete(trackingKey, fileIdx, totalFiles)
+			xlog.Debug("Staged file", "field", f.name, "remotePath", remotePath)
+			if primaryRemotePath == "" {
+				primaryRemotePath = remotePath
+			}
+		}
+
+		if stageFailed || primaryRemotePath == "" {
 			*f.val = ""
 			continue
 		}
 
-		r.stagingTracker.FileComplete(trackingKey, fileIdx, totalFiles)
-		xlog.Debug("Staged model field", "field", f.name, "remotePath", remotePath)
-		*f.val = remotePath
+		*f.val = primaryRemotePath
 
-		// Derive ModelPath from the first staged file (ModelFile).
-		// With tracking key namespacing:
+		// Derive ModelPath from the staged ModelFile.
 		// remotePath = "/worker/models/{trackingKey}/sd-cpp/models/flux.gguf"
 		// Model = "sd-cpp/models/flux.gguf"
 		// → ModelPath = "/worker/models/{trackingKey}"
 		if f.name == "ModelFile" && opts.Model != "" {
-			opts.ModelPath = DeriveRemoteModelPath(remotePath, opts.Model)
+			opts.ModelPath = DeriveRemoteModelPath(primaryRemotePath, opts.Model)
 			xlog.Debug("Derived remote ModelPath", "modelPath", opts.ModelPath)
 		}
 
-		r.stageCompanionFiles(ctx, node, localPath, keyMapper.Key)
+		r.stageCompanionFiles(ctx, node, localFieldPath, keyMapper.Key, trackingKey)
 	}
 
 	// Handle LoraAdapters (array) — rewritten to absolute remote paths
@@ -719,7 +766,7 @@ func (r *SmartRouter) withStagingCallback(ctx context.Context, trackingKey, file
 // localPath. For example, piper TTS implicitly loads ".onnx.json" next to
 // the ".onnx" model file. Errors are logged but not propagated.
 // keyFn generates the namespaced storage key for each file path.
-func (r *SmartRouter) stageCompanionFiles(ctx context.Context, node *BackendNode, localPath string, keyFn func(string) string) {
+func (r *SmartRouter) stageCompanionFiles(ctx context.Context, node *BackendNode, localPath string, keyFn func(string) string, trackingKey string) {
 	ext := filepath.Ext(localPath)
 	suffixes, ok := companionSuffixes[ext]
 	if !ok {
